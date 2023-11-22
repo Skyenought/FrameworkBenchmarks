@@ -2,7 +2,19 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
+	"math/rand"
+	"net"
+	"os"
+	"os/exec"
+	"runtime"
+	"sort"
+	"strconv"
+	"sync"
+	"syscall"
+	"unsafe"
+
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/app/server"
 	"github.com/cloudwego/hertz/pkg/app/server/render"
@@ -12,15 +24,12 @@ import (
 	"github.com/goccy/go-json"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"math/rand"
-	"runtime"
-	"sort"
-	"sync"
-	"unsafe"
+	"golang.org/x/sys/unix"
 )
 
 var (
-	db *pgxpool.Pool
+	db      *pgxpool.Pool
+	prefork bool
 )
 
 const (
@@ -30,13 +39,14 @@ const (
 	worldUpdate   = "UPDATE World SET randomNumber = $1 WHERE id = $2"
 	fortuneSelect = "SELECT id, message FROM Fortune;"
 
-	worldRowCount = 10000
-	jsonpath      = "/json"
-	dbpath        = "/db"
-	dbspath       = "/dbs"
-	fortunespath  = "/fortunes"
-	updatepath    = "/update"
-	plaintextpath = "/plaintext"
+	worldRowCount    = 10000
+	jsonpath         = "/json"
+	dbpath           = "/db"
+	dbspath          = "/dbs"
+	fortunespath     = "/fortunes"
+	updatepath       = "/update"
+	plaintextpath    = "/plaintext"
+	preforkChildFlag = "-prefork-child"
 )
 
 var helloworldRaw = []byte("Hello, World!")
@@ -51,8 +61,10 @@ type Fortune struct {
 	Message string `json:"message"`
 }
 
-type Fortunes []*Fortune
-type Worlds []World
+type (
+	Fortunes []*Fortune
+	Worlds   []World
+)
 
 func (s Fortunes) Len() int      { return len(s) }
 func (s Fortunes) Swap(i, j int) { s[i], s[j] = s[j], s[i] }
@@ -103,7 +115,7 @@ func dbs(c context.Context, ctx *app.RequestContext) {
 func fortunes(c context.Context, ctx *app.RequestContext) {
 	rows, _ := db.Query(context.Background(), fortuneSelect)
 	fortunes := make(Fortunes, 0)
-	for rows.Next() { //Fetch rows
+	for rows.Next() { // Fetch rows
 		fortune := Fortune{}
 		_ = rows.Scan(&fortune.Id, &fortune.Message)
 		fortunes = append(fortunes, &fortune)
@@ -145,10 +157,42 @@ func plaintext(c context.Context, ctx *app.RequestContext) {
 }
 
 func main() {
-	h := server.New(config.Option{F: func(o *config.Options) {
+	var h *server.Hertz
+	options := config.Option{F: func(o *config.Options) {
 		o.Addr = ":8080"
 		o.DisableHeaderNamesNormalizing = true
-	}})
+		if prefork {
+			o.ListenConfig = &net.ListenConfig{
+				Control: func(network, address string, c syscall.RawConn) error {
+					return c.Control(func(fd uintptr) {
+						syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+					})
+				},
+			}
+		}
+	}}
+
+	if prefork {
+		runtime.GOMAXPROCS(1)
+
+		if !PreforkIsChild() {
+			numCPU := runtime.NumCPU()
+			for i := 0; i < numCPU-1; i++ {
+				var env []string
+				env = append(env, os.Environ()...)
+				env = append(env, "GOMAXPROCS=1", "PREFORK_CHILD=1", "PREFORK_CHILD_ID="+strconv.Itoa(i+1))
+
+				cmd := exec.Command(os.Args[0], os.Args[1:]...)
+				cmd.Env = env
+				cmd.Stdout = os.Stdout
+				cmd.Stderr = os.Stderr
+				cmd.Stdin = os.Stdin
+				cmd.Start()
+			}
+		}
+	}
+
+	h = server.New(options)
 	render.ResetJSONMarshal(json.Marshal)
 	h.Use(func(c context.Context, ctx *app.RequestContext) {
 		switch b2s(ctx.Path()) {
@@ -171,6 +215,9 @@ func main() {
 }
 
 func init() {
+	flag.BoolVar(&prefork, "prefork", false, "use prefork")
+	flag.Parse()
+
 	maxConn := runtime.NumCPU() * 4
 
 	var err error
@@ -276,4 +323,30 @@ func GetUintOrZeroFromArgs(a *protocol.Args, key string) int {
 		v = vNew
 	}
 	return v
+}
+
+func uint16toa(n uint16) string {
+	if n == 0 {
+		return "0"
+	}
+
+	var b [5]byte
+	i := len(b) - 1
+	for n > 0 {
+		b[i] = byte(n%10) + '0'
+		n /= 10
+		i--
+	}
+
+	return b2s(b[i+1:])
+}
+
+func setCPUAffinity(cpu uint16) error {
+	var newMask unix.CPUSet
+	newMask.Set(int(cpu) - 1)
+	return unix.SchedSetaffinity(0, &newMask)
+}
+
+func PreforkIsChild() bool {
+	return os.Getenv("PREFORK_CHILD") == "1"
 }
